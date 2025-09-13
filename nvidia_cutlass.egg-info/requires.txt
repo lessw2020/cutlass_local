@@ -1,0 +1,6 @@
+cuda-python>=11.8.0
+networkx
+numpy
+pydot
+scipy
+treelib

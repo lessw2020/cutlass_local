@@ -9,7 +9,7 @@
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
-from .cutlass_dsl import (
+from CuTeDSL.cutlass_dsl import (
     Constexpr,
     as_numeric,
     min,
@@ -48,7 +48,7 @@ from .cute.typing import *
 from . import utils as utils
 
 # Used as internal symbol
-from . import cutlass_dsl as _dsl
+from CuTeDSL import cutlass_dsl as _dsl
 
 # Aliases
 LaunchConfig = _dsl.BaseDSL.LaunchConfig
