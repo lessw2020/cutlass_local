@@ -5,6 +5,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 import cuda.bindings.driver as cuda
+from cutlass.cute.runtime import from_dlpack
 
 class SimpleMbarrierKernel:
     """
@@ -72,7 +73,7 @@ class SimpleMbarrierKernel:
         
         # Make sure barrier is initialized before proceeding
         cute.arch.sync_warp()
-        cute.arch.sync_cta()
+        
         
         if is_producer:
             # PRODUCER PHASE: Write data to shared memory
@@ -92,6 +93,10 @@ class SimpleMbarrierKernel:
             
             # Producer can also wait if needed (for demonstration)
             cute.arch.mbarrier_wait(barrier_ptr, 0)
+
+            # Write result to output after synchronization to match expected values
+            shared_val = shared_data[producer_idx]
+            output_tensor[tidx] = shared_val + 1.0
             
         else:
             # CONSUMER PHASE: Wait for all producers, then read data
@@ -127,15 +132,18 @@ def run_mbarrier_example():
     input_data = torch.arange(num_threads//2, dtype=torch.float32, device='cuda')
     output_data = torch.zeros(num_threads, dtype=torch.float32, device='cuda')
     
-    # Convert to CUTE tensors
-    input_cute = cute.make_tensor(input_data)
-    output_cute = cute.make_tensor(output_data)
-    
+    # Ensure CUDA driver context is initialized
+    cutlass.cuda.initialize_cuda_context()
+
+    # Wrap framework tensors via DLPack; layout inferred dynamically
+    input_cute = from_dlpack(input_data).mark_layout_dynamic()
+    output_cute = from_dlpack(output_data).mark_layout_dynamic()
+
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
-    
-    # Compile and run
+
+    # Compile (manages its own MLIR context) and run
     compiled_kernel = cute.compile(kernel, input_cute, output_cute, current_stream)
     compiled_kernel(input_cute, output_cute, current_stream)
     
