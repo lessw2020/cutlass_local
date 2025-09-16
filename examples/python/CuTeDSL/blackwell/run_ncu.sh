@@ -11,7 +11,7 @@ export PYTHONPATH="/home/less/cutlass_local:${PYTHONPATH}"
 # verify: python -c "import cutlass, cutlass_cppgen; print('ok')"
 
 
-ncu --target-processes all --set full -- python -m examples.python.CuTeDSL.blackwell.dense_blockscaled_gemm_persistent \
+/usr/local/cuda-12.8/bin/ncu --target-processes all --set full -- python3 -m examples.python.CuTeDSL.blackwell.dense_blockscaled_gemm_persistent \
       --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN --sf_vec_size 16 \
       --c_dtype BFloat16 \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1 \
