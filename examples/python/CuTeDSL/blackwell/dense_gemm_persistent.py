@@ -40,6 +40,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import from_dlpack
 
 """
 A high-performance persistent batched dense GEMM example for the NVIDIA Blackwell SM100 architecture
@@ -1856,6 +1857,173 @@ def run(
     return exec_time  # Return execution time in microseconds
 
 
+# Global cache for compiled kernels {(dtype, mma_tiler_mn, cluster_shape_mn, use_2cta_instrs, use_tma_store): compiled_gemm}
+_COMPILED_KERNEL_CACHE = {}
+
+
+def cutlass_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    cluster_shape_mn: Tuple[int, int] = (2, 2),
+    use_2cta_instrs: bool = True,
+    use_tma_store: bool = True,
+) -> torch.Tensor:
+    """
+    PyTorch-friendly wrapper for CUTLASS persistent dense GEMM.
+    
+    Performs matrix multiplication: D = A @ B^T
+    Note: B is transposed, so this computes A @ B.T not A @ B
+    
+    Args:
+        A: Input tensor of shape [M, K] or [L, M, K] (batched)
+        B: Input tensor of shape [N, K] or [L, N, K] (batched)
+        mma_tiler_mn: MMA tile shape (M, N). Default: (256, 256)
+        cluster_shape_mn: Cluster shape (M, N). Default: (2, 2)
+        use_2cta_instrs: Enable 2CTA MMA instructions. Default: True
+        use_tma_store: Use TMA store. Default: True
+    
+    Returns:
+        Output tensor of same dtype as A, shape [M, N] or [L, M, N]
+    
+    Supported dtypes: float16, bfloat16, float32
+    
+    Examples:
+        >>> # Simple 2D matmul
+        >>> A = torch.randn(8192, 4096, dtype=torch.float16, device='cuda')
+        >>> B = torch.randn(8192, 4096, dtype=torch.float16, device='cuda')
+        >>> D = cutlass_matmul(A, B)  # Equivalent to: A @ B.T
+        >>> # D.shape = [8192, 8192]
+        
+        >>> # Batched matmul
+        >>> A = torch.randn(4, 2048, 1024, dtype=torch.float16, device='cuda')
+        >>> B = torch.randn(4, 2048, 1024, dtype=torch.float16, device='cuda')
+        >>> D = cutlass_matmul(A, B)  # Equivalent to: torch.bmm(A, B.transpose(1, 2))
+        >>> # D.shape = [4, 2048, 2048]
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for CUTLASS GEMM")
+    
+    # Ensure tensors are on GPU
+    if not A.is_cuda:
+        A = A.cuda()
+    if not B.is_cuda:
+        B = B.cuda()
+    
+    # Handle batching
+    if A.ndim == 2:
+        # Add batch dimension
+        A = A.unsqueeze(0)  # [1, M, K]
+        B = B.unsqueeze(0)  # [1, N, K]
+        squeeze_output = True
+    elif A.ndim == 3:
+        squeeze_output = False
+    else:
+        raise ValueError(f"A must be 2D or 3D, got shape {A.shape}")
+    
+    if B.ndim != A.ndim:
+        raise ValueError(f"A and B must have same number of dimensions. A: {A.shape}, B: {B.shape}")
+    
+    # Get dimensions
+    L, M, K = A.shape
+    _, N, K_B = B.shape
+    
+    if K != K_B:
+        raise ValueError(f"K dimension mismatch: A has K={K}, B has K={K_B}")
+    
+    # Determine dtypes - use CuTe types
+    torch2cute_dtype_map = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.TFloat32,
+    }
+    
+    if A.dtype not in torch2cute_dtype_map:
+        raise ValueError(f"Unsupported dtype: {A.dtype}. Supported: float16, bfloat16, float32")
+    
+    ab_dtype = torch2cute_dtype_map[A.dtype]
+    c_dtype = cutlass.Float16 if A.dtype == torch.float16 else \
+             cutlass.BFloat16 if A.dtype == torch.bfloat16 else \
+             cutlass.Float32
+    acc_dtype = cutlass.Float32
+    
+    # The CUTLASS kernel expects tensors in (M, K, L) and (N, K, L) format (batch dimension trailing)
+    # But PyTorch uses (L, M, K) and (L, N, K) format, so we need to permute
+    # Permute from (L, M, K) -> (M, K, L) following Quack's approach
+    # Don't call .contiguous() - the permuted view maintains K as the contiguous dimension
+    A = A.permute(1, 2, 0)  # (L, M, K) -> (M, K, L), strides become (K, 1, M*K)
+    B = B.permute(1, 2, 0)  # (L, N, K) -> (N, K, L), strides become (K, 1, N*K)
+    
+    # Create output tensor in (M, N, L) format, matching the baseline's layout
+    # cutlass_torch.matrix(l, mode0, mode1, ...) creates tensor with shape (mode0, mode1, l) = (M, N, L)
+    D_torch_cpu = cutlass_torch.matrix(L, M, N, False, c_dtype)  # is_mode0_major=False means N-major
+    D_torch = D_torch_cpu.cuda()  # Shape is (M, N, L)
+    
+    # Convert PyTorch tensors to CuTe tensors using Quack's approach
+    # D_torch is already in (M, N, L) format with N dimension having stride 1
+    A_cute = from_dlpack(A.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    B_cute = from_dlpack(B.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    D_cute = from_dlpack(D_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    
+    # Check cache for compiled kernel
+    # Use dtype names (strings) instead of dtype objects for hashability
+    cache_key = (ab_dtype.__name__, c_dtype.__name__, acc_dtype.__name__, 
+                 mma_tiler_mn, cluster_shape_mn, use_2cta_instrs, use_tma_store)
+    
+    if cache_key not in _COMPILED_KERNEL_CACHE:
+        # Create GEMM kernel
+        gemm = PersistentDenseGemmKernel(
+            acc_dtype=acc_dtype,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_tma_store=use_tma_store,
+        )
+        
+        # Get hardware info
+        hardware_info = utils.HardwareInfo()
+        max_active_clusters = hardware_info.get_max_active_clusters(
+            cluster_shape_mn[0] * cluster_shape_mn[1]
+        )
+        
+        # Get CUDA stream
+        torch_stream = torch.cuda.current_stream()
+        current_stream = cuda.CUstream(torch_stream.cuda_stream)
+        
+        # Compile kernel (only happens once per configuration)
+        compiled_gemm = cute.compile(
+            gemm,
+            A_cute,
+            B_cute,
+            D_cute,
+            max_active_clusters,
+            current_stream,
+        )
+        
+        _COMPILED_KERNEL_CACHE[cache_key] = compiled_gemm
+    else:
+        compiled_gemm = _COMPILED_KERNEL_CACHE[cache_key]
+        
+        # Still need stream for cached kernel
+        torch_stream = torch.cuda.current_stream()
+        current_stream = cuda.CUstream(torch_stream.cuda_stream)
+    
+    # Execute
+    compiled_gemm(A_cute, B_cute, D_cute, current_stream)
+    
+    # Synchronize to ensure completion
+    torch.cuda.synchronize()
+    
+    # D_torch is in (M, N, L) format, need to permute to PyTorch's (L, M, N) format
+    D_torch = D_torch.permute(2, 0, 1).contiguous()  # (M, N, L) -> (L, M, N)
+    
+    # Remove batch dimension if input was 2D
+    if squeeze_output:
+        D_torch = D_torch.squeeze(0)
+    
+    return D_torch
+
+
 if __name__ == "__main__":
 
     def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
@@ -1935,7 +2103,7 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run(
+    exec_time_us = run(
         args.mnkl,
         args.ab_dtype,
         args.c_dtype,
@@ -1953,4 +2121,11 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
     )
+    
+    # Print benchmark results
+    m, n, k, batch = args.mnkl
+    flops = 2 * m * n * k * batch
+    tflops = flops / (exec_time_us / 1e6) / 1e12
+    
+    print(f"\nBaseline Average time: {exec_time_us / 1000:.3f} ms, TFLOPS: {tflops:.1f}")
     print("PASS")

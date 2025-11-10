@@ -1765,7 +1765,7 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run(
+    exec_time_us = run(
         args.mnkl,
         args.ab_dtype,
         args.c_dtype,
@@ -1783,4 +1783,11 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
     )
+    
+    # Print benchmark results
+    m, n, k, batch = args.mnkl
+    flops = 2 * m * n * k * batch
+    tflops = flops / (exec_time_us / 1e6) / 1e12
+    
+    print(f"\nNonPersistent Average time: {exec_time_us / 1000:.3f} ms, TFLOPS: {tflops:.1f}")
     print("PASS")

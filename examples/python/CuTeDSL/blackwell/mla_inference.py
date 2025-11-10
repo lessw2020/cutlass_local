@@ -458,7 +458,9 @@ if __name__ == "__main__":
     latent_to_k = torch.randn(latent_dim, num_heads, qk_nope_head_dim, device=device, dtype=dtype)
     latent_to_v = torch.randn(latent_dim, num_heads, value_dim, device=device, dtype=dtype)
     kv_length = torch.full((bsz,), k_len, dtype=torch.int32, device=device)
-    softmax_scale = 1.0 / (qk_nope_head_dim ** 0.5)
+    # Softmax scale based on concatenated dimension (latent + rope)
+    # since kernel computes attention over [qk_nope_head_dim + qk_rope_head_dim]
+    softmax_scale = 1.0 / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
     
     print("Testing MLA Inference Wrapper")
     print("="*60)
