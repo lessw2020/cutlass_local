@@ -376,13 +376,232 @@ class PersistentAlphaDenseGemmKernel:
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
+        mB_nkl: cute.Tensor,
+        tma_atom_c: Optional[cute.CopyAtom],
+        mC_mnl: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout, 
+        b_smem_layout_staged: cute.ComposedLayout,
+        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+        epi_tile: cute.Tile,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+        epilogue_op: cutlass.Constexpr,
+    ):
+        """
+        GPU device kernel performing the Persistent alpha dense GEMM computation.
+        """
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        # prefetch tma descriptors
+        def alpha_prefetch_tma_descriptors(tma_atom_list: list[cute.CopyAtom]):
+            for tma_atom in tma_atom_list:
+                cpasync.prefetch_descriptor(tma_atom)
 
+        if warp_idx == self.tma_warp_id:
+            alpha_prefetch_tma_descriptors([tma_atom_a, tma_atom_b])
+            
+            if cutlass.const_expr(self.use_tma_store):
+                cpasync.prefetch_descriptor(tma_atom_c)
+        
+        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
+        # setup cta/thread coords
+        # coords inside cluster
+        bidx, bidy, bidz = cute.arch.block_idx()
+        mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+        is_leader_cta = mma_tile_coord_v == 0
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster
+        )
+        # coords inside cta
+        tidx, _, _ = cute.arch.thread_idx()
+        
+        # setup smem/tmem
+        # define shared storage for kernel
+        @cute.struct
+        class SharedStorage:
+            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage *2]
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+        
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
 
+        # init mainloop ab_pipeline barrier and states
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b -1
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producer)
 
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+            barrier_storage = storage.ab_full_mbar_ptr.data_ptr(),
+            num_stages = self.num_ab_stage,
+            producer_group = ab_pipeline_producer_group,
+            consumer_group = ab_pipeline_consumer_group,
+            tx_count = self.num_tma_load_bytes,
+            cta_layout_vmnk = cluster_layout_vmnk,
+        ).make_participants()
 
+        # init mainloop acc_pipeline barrier and states
+        acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        acc_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_acc_consumer_threads)
+        
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage = storage.acc_full_mbar_ptr.data_ptr(),
+            num_stages = self.num_acc_stage,
+            producer_group = acc_pipeline_producer_group,
+            consumer_group = acc_pipeline_consumer_group,
+            cta_layout_vmnk = cluster_layout_vmnk,
+        )
 
+        # init tmem alloc barrier
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id = self.tmem_alloc_sync_bar_id,
+            num_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
+        tmem_dealloc_barrier = None
+        if cutlass.const_expr(not self.use_tma_store):
+            tmem_dealloc_barrier = pipeline.NamedBarrier(
+                barrier_id = self.tmem_dealloc_sync_bar_id,
+                num_threads = 32 * len(self.epilog_warp_id),
+            )
+        # Tensor memory dealloc barrier init
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve = tmem_alloc_barrier,
+            allocator_warp_id = self.epilog_warp_id[0],
+            is_two_cta = use_2cta_instrs,
+            two_cta_tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr,
+        )
+        # Cluster arrive after barrier init
+        if cute.size(self.cluster_shape_mn) > 1:
+            cute.arch.cluster_arrive_relaxed()
+        
+        # setup smem tensor A/B/C/D
+        # (MMA, MMA_M, MMA_K, STAGE)
+        sA = smem.allocate_tensor(
+            element_type = self.a_dtype,
+            layout = a_smem_layout_staged.outer,
+            byte_alignment = 128,
+            swizzle = a_smem_layout_staged.inner,
+        )
+        # (MMA, MMA_N, MMA_K, STAGE)
+        sB = smem.allocate_tensor(
+            element_type = self.b_dtype,
+            layout = b_smem_layout_staged.outer,
+            byte_alignment = 128,
+            swizzle = b_smem_layout_staged.inner,
+        )
+        
+        # compute multicast mask for A/B buffer full
+        a_full_mcast_mask = None
+        b_full_mcast_mask = None
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, 
+                mcast_mode=2,
+            )
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, 
+                mcast_mode=1,
+            )
+        
+        # Local_tile partition global tensors
+        # (bM, bK, RestM, RestK, RestL)
+        gA_mkl = cute.local_tile(
+            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+        )
+        # (bN, bK, RestN, RestK, RestL)
+        gB_nkl = cute.local_tile(
+            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+        )
+        
+       # (bM, bN, RestM, RestN, RestL)
+        gC_mnl = cute.local_tile(
+            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+       )
 
+        k_tile_cnt = cute.size(gA_mkl, mode=[3]) # RestK
+
+        # partition global tensor for TiledMMA_A/B/C
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
+        tCgA = thr_mma.partition_A(gA_mkl)
+        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
+        tCgB = thr_mma.partition_B(gB_nkl)
+        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+        tCgC = thr_mma.partition_C(gC_mnl)
+        
+        # partition global/shared tensor for TMA load A/B
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0,0, None, 0)).shape
+        )
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
+        # ((atom_v, rest_v), STAGE)
+        # ((atom_v, rest_v), RestM, RestK, RestL)
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            block_in_cluster_coord_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(tCgA, 0, 3),
+        )
+        # ((atom_v, rest_v), STAGE)
+        # ((atom_v, rest_v), RestN, RestK, RestL)
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            block_in_cluster_coord_vmnk[1],
+            b_cta_layout,
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+    
+        # partition shared/tmem tensor for TiledMMA_A/B/C
+        # (MMA, MMA_M, MMA_K, STAGE)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        # (MMA, MMA_N, MMA_K, STAGE)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        # (MMA, MMA_M, MMA_N, STAGE)
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stage)
+        )
+        
+        # Cluster wait before tensor memory alloc
+        if cute.size(self.cluster_shape_mn) > 1:
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.sync_threads()
+        
+        # Alloc tensor memory buffer
+        tmem.allocate(self.num_tmem_alloc_cols)
+        
+        # specialized TMA load warp
+        if warp_idx == self.tma_warp_id:
+            # persistent tile scheduling loop
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            work_tile = tile_sched.initial_work_tile_info()
+            
+            while work_tile.is_valid_tile:
+                # get tile coord from tile scheduler
+                cur_tile_coord = work_tile.tile_idx
+                mma_tile_coord_mnl = (
+                    cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                    cur_tile_coord[1],
+                    cur_tile_coord[2],
+                )
+                
+                # slice to per mma tile index
+                # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
 
 
 
